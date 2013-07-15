@@ -1,0 +1,376 @@
+#!/usr/bin/perl -w
+
+##
+# sip-notify:  control state of a SIP client's message waiting indicator (MWI)
+# 
+# $Id: sip-notify,v 1.10 2006/10/13 20:15:24 shaug Exp $
+##
+
+
+use IO::File;
+use Getopt::Long;
+use DBI;
+use POSIX qw(tmpnam strftime);
+use vars qw($ME $VERSION $Usage %Flags @Sipsak_Cmd %DBINFO $SerDB
+            $context $nmsgs $dynamic);
+
+
+BEGIN {
+    $ENV{PATH} = '/usr/local/bin:/usr/bin:/bin';
+
+    $VERSION = '0.'. (split(' ', '$Id: sip-notify,v 1.10 2006/10/13 20:15:24 shaug Exp $'))[2];
+    $ME = 'sip-notify';
+
+    $Usage = <<EOusage;
+$ME:  control state of a SIP client's message waiting indicator (MWI)
+
+Usage:
+     $ME [<opts>] --new <# msgs> --old <# msgs> <sip address>
+  or $ME [<opts>] <context> <sip address> <# msgs>
+  or $ME [<opts>] --all
+
+Options:
+  --help        Show this usage text.
+  --man         Show the comprehensive documentation.
+  --verbose|-v  Show details of progress (give more than once for more info).
+  --version     Show the version ($VERSION).
+  --db          Update the voicemail status database with the user's number
+                of old and new messages.
+  --new #       The number of new voicemail messages waiting for the recipient.
+  --old #       The number of old voicemail messages waiting for the recipient.
+  --all         Send a SIP NOTIFY message to every user who has subscribed
+                to their voicemail updates.
+
+The second form of usage is designed to allow sip-notify to be called
+from the Asterisk PBX voicemail module, as an "externnotify" command.
+(See www.asterisk.org.)  The MWI state is figured out based on the number
+of message files the mailbox has in the Asterisk spool (the location of
+which is partly determined by the given context).
+
+In the third form of usage, every SIP user that has subscribed to voicemail
+notifications will be sent a NOTIFY message with the current status of their
+voicemail.
+
+EOusage
+
+    # how to we call sipsak?
+    @Sipsak_Cmd = qw(sipsak -p __CHANGEME__SIP_PROXY__ -r 5060 -G);
+
+    # what's our default SIP recipient domain?
+    use constant SIP_DOMAIN   => '__CHANGEME__SIP_DOMAIN__;
+
+    # where does Asterisk keep its voicemail messages?
+    use constant AST_VM_SPOOL => '/var/spool/asterisk/voicemail';
+    use constant AST_INBOX    => 'INBOX';
+
+    # SIP headers we don't want to bury in code
+    use constant MWI_LABEL => 'Messages-Waiting';
+    use constant VM_LABEL  => 'Voicemail';
+
+    # Ser database connection and usage info
+    use constant MYSQL_CNF => '/usr/local/etc/my.cnf-ser';
+    use constant SUB_TABLE => 'grp';
+    use constant SUB_GROUP => 'voicemail';
+    use constant VM_TABLE  => 'voicemail_status';
+
+    %DBINFO = (
+        # how to we connect to the various databases?
+        SER_DSN => 'DBI:mysql:ser;mysql_read_default_file='.MYSQL_CNF,
+
+        # voicemail status table queries
+        VM_CHECK => 'SELECT username from '. VM_TABLE. ' where username = ? '.
+                    'and domain = ?',
+        VM_INS   => 'INSERT into '. VM_TABLE. '(username, domain, new, old, '.
+                    'lastmod)  VALUES (?, ?, ?, ?, NOW())',
+        VM_MOD   => 'UPDATE '. VM_TABLE. ' set new = ?, old = ?, '.
+                    'lastmod = NOW() where username = ? and domain = ?',
+ 
+        # subscriber table queries
+        SUB_SEL  => 'SELECT username FROM '. SUB_TABLE.' where grp = "'.
+                    SUB_GROUP. '"',
+
+        # The voicemail table "domain" field somehow gets out of sync with
+	# the subscriber table's "domain".  This update statement fixes that.
+	DOM_SYNC => 'update '. VM_TABLE. ' as vm, '. SUB_TABLE. ' as sub '.
+	            'set vm.domain = sub.domain '.
+		    'where vm.username = sub.username'
+    );
+
+    $| = 1;
+}
+
+
+# handle the command-line
+$Flags{verbose} = 0;
+GetOptions('verbose|v+' => \$Flags{verbose},
+           'version'    => \$Flags{version},
+           'help'       => \$Flags{help},
+           'man'        => \$Flags{man},
+           'new=i'      => \$Flags{new},
+           'old=i'      => \$Flags{old},
+           'db'         => \$Flags{db},
+           'all'        => \$Flags{all}
+          )
+ or die($Usage);
+if ($Flags{version}) {
+    print "$ME version $VERSION\n";
+    exit 0;
+}
+elsif ($Flags{help}) {
+    print $Usage;
+    exit 0;
+}
+elsif ($Flags{man}) {
+    use Pod::Usage;
+    pod2usage(-verbose => 2, -exitval => 0);
+}
+
+# first make sure we can connect to the ser db.  if we can't, exit.
+if ($Flags{db}) {
+    $SerDB = DBI->connect($DBINFO{SER_DSN}, '', '', { RaiseError => 1,
+             AutoCommit => 0 });
+}
+
+
+# figure out which mode we're running in, and set @reciplist, $dynamic, and
+# $context appropriately
+
+my @reciplist;
+if (@ARGV == 1) {
+    $dynamic = defined $Flags{new} && defined $Flags{old} ? 0 : 1;
+    $context = 'default';
+    @reciplist = @ARGV;
+}
+elsif (@ARGV == 3) {
+    $dynamic = 1;
+    $context   = shift @ARGV;
+    @reciplist = (shift @ARGV);
+    $nmsgs     = shift @ARGV;
+    if ($Flags{verbose} > 0) {
+        print "Asterisk mode:  context=$context addr=@reciplist ".
+              "nmsgs=$nmsgs\n\n";
+    }
+}
+elsif ($Flags{all}) {
+    $dynamic = 1;
+    $context = 'default';
+    read_subscribers(\@reciplist);
+    if ($Flags{verbose} > 0) {
+        print "All mode:  ". scalar @reciplist. " recipients\n\n";
+    }
+}
+else {
+    print "ERROR:  Sorry, but I need a recipient address or --all.\n\n".
+          $Usage;
+    exit 1;
+}
+
+# set sipsak verbosity
+for (my $i = 0; $i < $Flags{verbose}; $i++) {
+    push @Sipsak_Cmd, '-v';
+}
+
+# read everything from the __DATA__ filehandle at the end of this script
+# to our basic sip data message.  note that lines are terminated with \r\n
+# instead of \n.
+my $sipdata;
+while (<DATA>) {
+    chomp $_;
+    $sipdata .= "$_\r\n";
+}
+
+# sync up the voicemail table's phone number domains so they match up with
+# the domains in the ser subscriber table.
+if ($Flags{db}) {
+    do_sql($SerDB, $DBINFO{DOM_SYNC}, 0);
+}
+
+# run through all the phone numbers -- either those given on the cmd line
+# or all found in the subscribers table
+foreach my $addr (@reciplist) {
+    my ($tmpnam, @sipsak, $mwi_stat, $new, $old, $mwi_hdr, $vm_hdr,
+        $content_length, $sipmsg);
+    @sipsak = @Sipsak_Cmd;
+
+    print "\nNOTIFY $addr\n===========================\n"
+     if $Flags{verbose} > 0;
+
+    # figure if we're turning the MWI light on or off
+    ($mwi_stat, $new, $old) = get_mwi_stat($addr, $dynamic, $Flags{new},
+                                           $Flags{old});
+    $mwi_hdr = MWI_LABEL. ": $mwi_stat";
+    $vm_hdr  = VM_LABEL. ": $new/$old";
+
+    # make sure the recipient address has the sip: prefix
+    # and if there's no domain, append the default domain
+    $addr = 'sip:'.$addr unless $addr =~ /^sip:/i;
+    $addr .= '@'. SIP_DOMAIN unless $addr =~ /@/;
+
+    # figure out our content-length header
+    $content_length = "Content-Length: ". (length($mwi_hdr) + length($vm_hdr));
+
+    # create a new temporary file for the SIP message that we're going to send
+    do { $tmpnam = tmpnam() }
+    until $sipmsg = IO::File->new($tmpnam, O_RDWR|O_CREAT|O_EXCL);
+    seek($sipmsg, 0, 0);
+
+    print $sipmsg $sipdata;
+    print $sipmsg $content_length. "\r\n";
+    print $sipmsg "\r\n\r\n";
+    print $sipmsg $mwi_hdr. "\r\n";
+    print $sipmsg $vm_hdr. "\r\n";
+
+    push @sipsak, '-f', $tmpnam, '-s', $addr;
+    if ($Flags{verbose} > 1) {
+        print "\nSIP message:\n====================\n";
+        system('cat', $tmpnam);
+        print "end of SIP message\n====================\n";
+    }
+    print "@sipsak\n" if $Flags{verbose} > 1;
+    system @sipsak;
+
+    $sipmsg->close();
+
+    -f $tmpnam and unlink($tmpnam)
+     || print STDERR "$ME:  couldn't unlink $tmpnam: $!\n";
+
+    # update voicemail status db table with current number of new and old msgs
+    if ($Flags{db}) {
+        my ($user, $domain) = $addr =~ /^sip:([^@]+)@(.*)$/;
+        if (do_sql($SerDB, $DBINFO{VM_CHECK}, 1, $user, $domain)) {
+            do_sql($SerDB, $DBINFO{VM_MOD}, 0, $new, $old, $user, $domain);
+        }
+        else {
+            do_sql($SerDB, $DBINFO{VM_INS}, 0, $user, $domain, $new, $old);
+        }
+    }
+}
+
+
+sub get_mwi_stat
+{
+    my ($user, $dynamic, $new, $old) = @_;
+
+    print "checking voicemail.  dynamic?  $dynamic\n" if $Flags{verbose} > 2;
+
+    if ($dynamic) {
+        my ($vmdir, @msgdirs);
+        $new = 0;
+        $old = 0;
+
+        local (*SPOOLDIR, *MSGDIR);
+        $vmdir = join('/', AST_VM_SPOOL, $context, $user);
+
+        if (opendir SPOOLDIR, $vmdir) {
+            print "searching $vmdir\n" if $Flags{verbose};
+            @msgdirs = grep(/^[^.]/ && -d "$vmdir/$_", readdir SPOOLDIR);
+            closedir SPOOLDIR;
+
+            foreach my $d (@msgdirs) {
+                if (opendir MSGDIR, "$vmdir/$d") {
+                    if ($d eq AST_INBOX) {
+                        $new = scalar grep(/\.txt$/ && -f "$vmdir/$d/$_",
+                                           readdir MSGDIR);
+                    }
+                    else {
+                        $old += scalar grep(/\.txt$/ && -f "$vmdir/$d/$_",
+                                            readdir MSGDIR);
+                    }
+                    closedir MSGDIR;
+                }
+            }
+        }
+        else {
+            print STDERR "couldn't read $vmdir: $!\n";
+        }
+    }
+
+    return ($new > 0 ? 'yes' : 'no', $new, $old);
+}
+
+
+sub read_subscribers
+{
+    my $sublist = shift;
+    my ($sub_sel, $found);
+
+    # prepare SQL statements for working with the ser group table.
+    # the ?'s get filled in at runtime
+    $sub_sel = $SerDB->prepare($DBINFO{SUB_SEL});
+
+    $sub_sel->execute();
+    foreach my $ref (@{$sub_sel->fetchall_arrayref()}) {
+        push @$sublist, @$ref;
+    }
+    $sub_sel->finish();
+}
+
+
+##
+# dprint($level, $mesg):
+# 
+# Print the given message if the verbosity level is above $level.
+##
+sub dprint
+{
+    my ($level, $mesg) = @_;
+
+    return unless $Flags{verbose} and $Flags{verbose} >= $level;
+
+    if ($level == 0) {
+        print "$mesg";
+    }
+    else {
+        print '[D'. $level. '] '. $mesg;
+    }
+}
+
+
+##
+# do_sql($dbh, $template, $want_data, @data):
+# 
+# Execute the SQL statement in $template with @data as the values.
+# 
+# returns:  if want_data is nonzero, returns the 1st array of data on success.
+#   otherwise, returns 1 on success.  returns 0 on failure.
+##
+sub do_sql
+{
+    my ($dbh, $template, $want_data, @data) = @_;
+    my ($sql);
+
+    $sql = $dbh->prepare($template)
+     or die("ERROR:  SQL statement is misconfigured:  ". $sql->errstr);
+    if ($Flags{nochange}) {
+        return 1;
+    }
+    else {
+        dprint(3, "\n\n");
+        dprint(3, "SQL:  $template\n");
+        dprint(3, "Data:  ". join(', ', @data). "\n\n");
+        $sql->execute(@data);
+        if ($sql->err) {
+            print STDERR "ERROR:  ". $sql->errstr. "\n";
+            return 0;
+        }
+    }
+
+    return $want_data ? $sql->fetchrow_array() : 1;
+}
+
+
+END {
+    $SerDB->disconnect if $SerDB;
+}
+
+
+__DATA__
+NOTIFY sip:$user$@$dsthost$ SIP/2.0
+From: <sip:asterisk@$srchost$>
+To: <sip:$user$@$dsthost$>
+Contact: <sip:$user$@$dsthost$>
+Call-ID: 4d61cf9e505d40e905032a18329d61ec@$srchost$
+CSeq: 1 NOTIFY
+User-Agent: sipsak
+Event: message-summary
+Content-Type: text/plain

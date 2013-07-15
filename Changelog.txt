@@ -1,0 +1,62 @@
+
+RCS file: sip-notify,v
+Working file: sip-notify
+head: 1.10
+branch:
+locks: strict
+access list:
+symbolic names:
+keyword substitution: kv
+total revisions: 10;	selected revisions: 10
+description:
+script to send a NOTIFY mesg via SIP
+(intended to control state of a SIP user agent's Message Waiting Indicator)
+----------------------------
+revision 1.10
+date: 2006/10/13 20:15:24;  author: root;  state: Exp;  lines: +3 -3
+had to change sipsak proxy from host A to host B's private IP
+----------------------------
+revision 1.9
+date: 2006/10/13 20:05:29;  author: root;  state: Exp;  lines: +14 -2
+added --db flag to update the database with the current message status
+----------------------------
+revision 1.8
+date: 2005/06/30 22:51:51;  author: root;  state: Exp;  lines: +119 -29
+added --db feature which updates a table in the ser db with
+status info about the # of new and old msgs for the account being
+checked
+----------------------------
+revision 1.7
+date: 2004/12/14 00:15:37;  author: root;  state: Exp;  lines: +5 -4
+make sure to remove the tmp files after we're done with them
+----------------------------
+revision 1.6
+date: 2004/10/09 00:51:04;  author: root;  state: Exp;  lines: +18 -10
+fixed bug in --all mode:  only the 1st recipient was getting the full
+sip message (as read from __DATA__)
+----------------------------
+revision 1.5
+date: 2004/10/09 00:24:18;  author: root;  state: Exp;  lines: +3 -3
+check for presence in the voicemail group instead of subscribed
+----------------------------
+revision 1.4
+date: 2004/10/09 00:18:27;  author: root;  state: Exp;  lines: +22 -16
+fixed a few things:  if in single-addr notify mode, dynamic generation of
+new and old msg count is supported
+in --all mode, the domain is no longer read from the grp table.  this
+was messing up searching the asterisk vm spool
+----------------------------
+revision 1.3
+date: 2004/10/08 23:54:49;  author: root;  state: Exp;  lines: +127 -61
+added --all feature, which required a bit of cleanup in the code.
+this feature will check every subscribed mailbox (using the ser grp table)
+and send a notify that reflects current voicemail status
+----------------------------
+revision 1.2
+date: 2004/10/08 22:31:52;  author: root;  state: Exp;  lines: +9 -9
+call system w/an array, not a string -- much safer and more reliable
+----------------------------
+revision 1.1
+date: 2004/10/07 22:42:32;  author: root;  state: Exp;
+Initial revision
+=============================================================================
